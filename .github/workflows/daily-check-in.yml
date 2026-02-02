@@ -29,6 +29,8 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.9.19'
+          cache: 'pip'
+          cache-dependency-path: requirements.txt
 
       - name: Install python dependencies
         run: |
@@ -37,7 +39,7 @@ jobs:
 
       - name: Execute script
         env:
-          # 你脚本会优先读 LINUXDO_USERNAME/LINUXDO_PASSWORD，再 fallback USERNAME/PASSWORD
+          # 登录账号（脚本优先使用 LINUXDO_*）
           LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
           USERNAME: ${{ secrets.USERNAME }}
@@ -49,32 +51,33 @@ jobs:
           WXPUSH_URL: ${{ secrets.WXPUSH_URL }}
           WXPUSH_TOKEN: ${{ secrets.WXPUSH_TOKEN }}
 
-          # 建议放 variables 而不是 secrets 也行；这里保持你原来写法
           BROWSE_ENABLED: ${{ secrets.BROWSE_ENABLED }}
         run: |
           python main.py
 
-      - name: Send Telegram Notification
+      - name: Send Telegram Success Notification
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_USERID: ${{ secrets.TELEGRAM_USERID }}
+          LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
         if: ${{ success() && env.TELEGRAM_TOKEN != '' && env.TELEGRAM_USERID != '' }}
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ env.TELEGRAM_TOKEN }}/sendMessage" \
           -d chat_id=${{ env.TELEGRAM_USERID }} \
           -d parse_mode=HTML \
-          -d text="✅ <b>LINUX DO</b> 每日签到成功完成"
+          -d text="✅ <b>LINUX DO</b>\n👤 用户：<code>${{ env.LINUXDO_USERNAME }}</code>\n🎉 每日签到成功完成"
 
-      - name: Send Failure Notification
+      - name: Send Telegram Failure Notification
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_USERID: ${{ secrets.TELEGRAM_USERID }}
+          LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
         if: ${{ failure() && env.TELEGRAM_TOKEN != '' && env.TELEGRAM_USERID != '' }}
         run: |
           curl -s -X POST "https://api.telegram.org/bot${{ env.TELEGRAM_TOKEN }}/sendMessage" \
           -d chat_id=${{ env.TELEGRAM_USERID }} \
           -d parse_mode=HTML \
-          -d text="❌ <b>LINUX DO</b> 每日签到失败"
+          -d text="❌ <b>LINUX DO</b>\n👤 用户：<code>${{ env.LINUXDO_USERNAME }}</code>\n⚠️ 每日签到失败，请查看 Actions 日志"
 
       - name: Delete workflow runs
         uses: Mattraks/delete-workflow-runs@v2
