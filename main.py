@@ -275,8 +275,8 @@ class LinuxDoBrowser:
             logger.error((self.page.html or "")[:500])
             return False
 
-        logger.info(f"发现 {len(topic_links)} 个主题帖，随机选择10个")
-        for a in random.sample(topic_links, min(10, len(topic_links))):
+        logger.info(f"发现 {len(topic_links)} 个主题帖，随机选择50个")
+        for a in random.sample(topic_links, min(50, len(topic_links))):
             href = a.attr("href")
             if not href:
                 continue
