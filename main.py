@@ -72,6 +72,7 @@ MAX_LOOP_FACTOR = float(os.environ.get("MAX_LOOP_FACTOR", "8"))
 MIN_READ_STAY = float(os.environ.get("MIN_READ_STAY", "5"))
 READ_STATE_TIMEOUT = float(os.environ.get("READ_STATE_TIMEOUT", "20"))
 
+# 接近底部触发加载：等待楼层增长的最长时间（秒）
 NEAR_BOTTOM_WAIT_TIMEOUT = float(os.environ.get("NEAR_BOTTOM_WAIT_TIMEOUT", "22"))
 
 # 每次翻页后：最多尝试阅读多少个“仍有蓝点”的楼层（找不到就跳过）
@@ -329,10 +330,10 @@ class LinuxDoBrowser:
         try:
             return int(
                 page.run_js(
-                    r"""
+                    """
                     let maxN = 0;
                     document.querySelectorAll('[id^="post_"]').forEach(el => {
-                      const m = el.id.match(/^post_(\d+)$/);
+                      const m = el.id.match(/^post_(\\d+)$/);
                       if (m) maxN = Math.max(maxN, parseInt(m[1], 10));
                     });
                     return maxN;
@@ -346,7 +347,11 @@ class LinuxDoBrowser:
     def _post_count_in_dom(self, page) -> int:
         try:
             return int(
-                page.run_js(r"return document.querySelectorAll('[id^="post_"]').length;")
+                page.run_js(
+                    """
+                    return document.querySelectorAll('[id^="post_"]').length;
+                    """
+                )
                 or 0
             )
         except Exception:
@@ -358,7 +363,7 @@ class LinuxDoBrowser:
     def scroll_near_bottom(self, page):
         try:
             page.run_js(
-                r"""
+                """
                 const h = document.body.scrollHeight;
                 const ratio = 0.90 + Math.random() * 0.05;
                 window.scrollTo(0, Math.floor(h * ratio));
@@ -380,13 +385,13 @@ class LinuxDoBrowser:
         return best
 
     # ----------------------------
-    # Read-state / Blue-dot (只看 class read)
+    # Read-state / Blue-dot
     # ----------------------------
     def _post_is_read(self, page, post_id: int) -> bool:
         try:
             return bool(
                 page.run_js(
-                    r"""
+                    """
                     const pid = arguments[0];
                     const root = document.querySelector(`#post_${pid}`);
                     if (!root) return false;
@@ -405,7 +410,7 @@ class LinuxDoBrowser:
     def wait_blue_dot_gone(self, page, post_id: int, min_stay=5.0, timeout=20.0) -> bool:
         try:
             page.run_js(
-                r"""
+                """
                 const pid = arguments[0];
                 const el = document.querySelector(`#post_${pid}`);
                 if (el) el.scrollIntoView({behavior:'instant', block:'center'});
@@ -415,7 +420,6 @@ class LinuxDoBrowser:
         except Exception:
             pass
 
-        # 至少停留（蓝点需要时间消失）
         time.sleep(min_stay)
 
         if self._post_is_read(page, post_id):
@@ -429,7 +433,7 @@ class LinuxDoBrowser:
         return False
 
     # ----------------------------
-    # Only read unread posts (仍有蓝点) —— NEW
+    # Only read unread posts (仍有蓝点) —— KEY
     # ----------------------------
     def pick_unread_post_ids(self, page, limit=2):
         """
@@ -438,16 +442,17 @@ class LinuxDoBrowser:
         """
         try:
             ids = page.run_js(
-                r"""
+                """
                 const out = [];
                 document.querySelectorAll('[id^="post_"]').forEach(root => {
-                  const m = root.id.match(/^post_(\d+)$/);
+                  const m = root.id.match(/^post_(\\d+)$/);
                   if (!m) return;
                   const rs = root.querySelector('.topic-meta-data .post-infos .read-state');
                   if (!rs) return;
                   if (!rs.classList.contains('read')) out.push(parseInt(m[1], 10));
                 });
-                // 打乱
+
+                // shuffle
                 for (let i = out.length - 1; i > 0; i--) {
                   const j = Math.floor(Math.random() * (i + 1));
                   [out[i], out[j]] = [out[j], out[i]];
@@ -457,7 +462,7 @@ class LinuxDoBrowser:
             )
             if not ids:
                 return []
-            ids = [int(x) for x in ids if isinstance(x, (int, float, str))]
+            ids = [int(x) for x in ids if str(x).isdigit()]
             if limit and len(ids) > limit:
                 ids = ids[:limit]
             return ids
@@ -467,7 +472,7 @@ class LinuxDoBrowser:
     def read_only_unread_posts(self, page, max_reads=2):
         """
         只读“仍有蓝点”的楼层；已读楼层跳过
-        找不到未读楼层就什么都不做（不强行停留）
+        找不到未读楼层就不强行停留
         """
         unread_ids = self.pick_unread_post_ids(page, limit=max_reads)
         if not unread_ids:
@@ -545,7 +550,6 @@ class LinuxDoBrowser:
 
             if at_bottom:
                 logger.success("已到达页面底部，结束浏览")
-                # 短主题容错
                 if cur_max_no <= (min_pages * PAGE_GROW + 5):
                     logger.info(f"主题较短（max_post_no≈{cur_max_no}），放宽最小页数要求，视为完成")
                     return True
@@ -614,6 +618,9 @@ class LinuxDoBrowser:
             except Exception:
                 pass
 
+    # ----------------------------
+    # Like
+    # ----------------------------
     def click_like(self, page):
         try:
             like_button = page.ele(".discourse-reactions-reaction-button")
