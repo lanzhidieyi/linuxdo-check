@@ -58,9 +58,21 @@ BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in
     "off",
 ]
 
-# 你要的：至少浏览 5~10 “页/批次” 评论（默认）
+# 每次运行最多进入多少个话题帖
+MAX_TOPICS = int(os.environ.get("MAX_TOPICS", "50"))
+
+# 每个话题至少/最多浏览多少“页/批次”评论
 MIN_COMMENT_PAGES = int(os.environ.get("MIN_COMMENT_PAGES", "5"))
 MAX_COMMENT_PAGES = int(os.environ.get("MAX_COMMENT_PAGES", "10"))
+
+# 用“帖子节点增长”计页时，每增长多少个帖子算 1 页（可调小/大）
+PAGE_POST_GROW = int(os.environ.get("PAGE_POST_GROW", "10"))
+
+# 你提供的：评论内容 XPath（用于确认评论真实渲染完成）
+COMMENT_XPATH = os.environ.get(
+    "COMMENT_XPATH",
+    "/html/body/section/div[1]/div[4]/div[2]/div[3]/div[3]/div[3]/section/div[1]/div[2]/div[4]/article/div/div[2]/div[2]",
+)
 
 GOTIFY_URL = os.environ.get("GOTIFY_URL")
 GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")
@@ -240,7 +252,7 @@ class LinuxDoBrowser:
         logger.info("Cookie 设置完成，导航至主题列表页 /latest ...")
         self.page.get(LIST_URL)
 
-        # Discourse 前端渲染：更稳的等待策略
+        # Discourse 前端渲染等待
         try:
             self.page.wait.ele("@id=main-outlet", timeout=25)
         except Exception:
@@ -251,7 +263,6 @@ class LinuxDoBrowser:
             logger.warning("未等到主题链接 a.raw-topic-link，输出页面信息辅助定位")
             logger.warning(f"url={self.page.url}")
             logger.warning((self.page.html or "")[:500])
-            # requests 已登录成功，这里不强行失败
             return True
 
         logger.info("主题列表已渲染，登录&页面加载完成")
@@ -271,177 +282,252 @@ class LinuxDoBrowser:
         return False
 
     # ----------------------------
-    # Topic load helpers (关键：评论/回复加载)
+    # XPath helpers (用于确认评论真实渲染)
     # ----------------------------
-    def wait_topic_posts_ready(self, page, timeout=35) -> bool:
-        """
-        等待话题页的帖子流出现，并尽量等加载状态结束
-        """
-        end = time.time() + timeout
-
-        # 等至少一个 post
+    def _xpath_exists(self, page, xpath: str) -> bool:
         try:
-            page.wait.ele("css:article.topic-post", timeout=min(20, timeout))
+            return bool(
+                page.run_js(
+                    r"""
+                const xp = arguments[0];
+                const n = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                return !!n;
+            """,
+                    xpath,
+                )
+            )
         except Exception:
-            logger.warning("未等到 article.topic-post（帖子流），可能结构变更或被拦截")
             return False
 
-        # 等 aria-busy / 常见 loading 消失
+    def _xpath_visible(self, page, xpath: str) -> bool:
+        try:
+            return bool(
+                page.run_js(
+                    r"""
+                const xp = arguments[0];
+                const n = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                if (!n) return false;
+                const r = n.getBoundingClientRect();
+                const style = window.getComputedStyle(n);
+                return r.width > 0 && r.height > 0 && style.visibility !== 'hidden' && style.display !== 'none' && style.opacity !== '0';
+            """,
+                    xpath,
+                )
+            )
+        except Exception:
+            return False
+
+    def _xpath_text_len(self, page, xpath: str) -> int:
+        try:
+            return int(
+                page.run_js(
+                    r"""
+                const xp = arguments[0];
+                const n = document.evaluate(xp, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                if (!n) return 0;
+                return (n.innerText || n.textContent || '').trim().length;
+            """,
+                    xpath,
+                )
+                or 0
+            )
+        except Exception:
+            return 0
+
+    def wait_comment_loaded_by_xpath(self, page, xpath: str, timeout=45) -> bool:
+        """
+        等评论区域真正加载：
+        - XPath 节点存在
+        - 可见
+        - 文本非空（避免只是壳）
+        """
+        end = time.time() + timeout
         while time.time() < end:
-            try:
-                busy = page.run_js("""
-                    const ps = document.querySelector('#post-stream');
-                    return ps && ps.getAttribute('aria-busy') === 'true';
-                """)
-                if busy:
-                    time.sleep(0.4)
-                    continue
+            if self._xpath_exists(page, xpath) and self._xpath_visible(page, xpath):
+                if self._xpath_text_len(page, xpath) > 0:
+                    return True
+            time.sleep(0.5)
+        return False
 
-                loading_visible = page.run_js("""
-                    const sels = [
-                      '.spinner', '.loading-container', '.loading', '.topic-loading',
-                      '.composer-loading', '.discourse-spinner'
-                    ];
-                    return sels.some(sel => {
-                      const el = document.querySelector(sel);
-                      if (!el) return false;
-                      const st = window.getComputedStyle(el);
-                      return st && st.display !== 'none' && st.visibility !== 'hidden' && st.opacity !== '0';
-                    });
-                """)
-                if loading_visible:
-                    time.sleep(0.4)
-                    continue
+    # ----------------------------
+    # Timeline helpers (蓝点区域)
+    # ----------------------------
+    def _topic_progress_text(self, page) -> str:
+        try:
+            return (
+                page.run_js(
+                    """
+                const a = document.querySelector('#topic-progress');
+                if (a) return a.innerText.trim();
+                const b = document.querySelector('.topic-timeline .current-post');
+                if (b) return b.innerText.trim();
+                const c = document.querySelector('.timeline-container .current-post');
+                if (c) return c.innerText.trim();
+                return '';
+            """
+                )
+                or ""
+            ).strip()
+        except Exception:
+            return ""
 
-                # 稳妥：再等一下
-                time.sleep(random.uniform(1.2, 2.0))
-                return True
-            except Exception:
-                time.sleep(0.5)
-
-        logger.warning("等待帖子流 ready 超时")
-        return True  # 不硬失败，避免影响后续
+    def _current_post_number(self, page) -> int:
+        try:
+            s = self._topic_progress_text(page)
+            m = re.search(r"#(\\d+)", s)
+            return int(m.group(1)) if m else 0
+        except Exception:
+            return 0
 
     def wait_topic_progress_stable(self, page, stable_seconds=2.5, timeout=25) -> bool:
         """
-        等右侧时间轴（你图里蓝点所在区域）稳定：
-        判定标准：#topic-progress 的 innerText 在 stable_seconds 内不再变化
+        等右侧时间轴（蓝点区域）稳定：文本 stable_seconds 内不再变化
         """
         end = time.time() + timeout
         last_text = None
         stable_start = None
 
         while time.time() < end:
-            try:
-                text = page.run_js("""
-                    const el = document.querySelector('#topic-progress');
-                    return el ? el.innerText.trim() : null;
-                """)
-                if not text:
-                    time.sleep(0.4)
-                    continue
-
-                if text == last_text:
-                    if stable_start is None:
-                        stable_start = time.time()
-                    elif time.time() - stable_start >= stable_seconds:
-                        return True
-                else:
-                    last_text = text
-                    stable_start = None
-
+            text = self._topic_progress_text(page)
+            if not text:
                 time.sleep(0.4)
-            except Exception:
-                time.sleep(0.4)
+                continue
+
+            if text == last_text:
+                if stable_start is None:
+                    stable_start = time.time()
+                elif time.time() - stable_start >= stable_seconds:
+                    return True
+            else:
+                last_text = text
+                stable_start = None
+            time.sleep(0.4)
 
         return False
 
-    def _current_post_number(self, page) -> int:
-        """从右侧时间轴提取当前楼层号，如 '#2422' -> 2422；取不到返回 0"""
+    # ----------------------------
+    # Count posts as fallback
+    # ----------------------------
+    def _topic_article_count(self, page) -> int:
         try:
-            s = page.run_js("""
-                const el = document.querySelector('#topic-progress');
-                return el ? el.innerText : '';
-            """) or ""
-            m = re.search(r"#(\\d+)", s)
-            return int(m.group(1)) if m else 0
+            return int(
+                page.run_js(
+                    r"""
+                const ps = document.querySelector('#post-stream') || document;
+                let n = ps.querySelectorAll('article').length;
+                if (n) return n;
+                n = ps.querySelectorAll('.topic-post, .post').length;
+                return n || 0;
+            """
+                )
+                or 0
+            )
         except Exception:
             return 0
 
+    # ----------------------------
+    # Wait topic ready (用 XPath 为主)
+    # ----------------------------
+    def wait_topic_posts_ready(self, page, timeout=50) -> bool:
+        """
+        linux.do 实测：用评论内容 XPath 判断最稳
+        """
+        ok = self.wait_comment_loaded_by_xpath(page, COMMENT_XPATH, timeout=timeout)
+        if not ok:
+            logger.warning("未等到评论内容 XPath（可能结构变化/被拦截/页面未渲染）")
+            return False
+
+        # 给前端状态更新一点时间
+        time.sleep(random.uniform(1.0, 2.0))
+        return True
+
+    # ----------------------------
+    # Browse replies pages (5-10)
+    # ----------------------------
     def browse_replies_pages(self, page, min_pages=5, max_pages=10):
         """
-        至少浏览 min_pages 页，最多 max_pages 页（按“右侧楼层号增长”计页）
+        至少浏览 min_pages 页，最多 max_pages 页
+        计页策略：
+          1) 优先：右侧楼层号增长（#2422 这种）
+          2) fallback：帖子节点数量每增长 PAGE_POST_GROW 记 1 页
+        短帖策略：到底且总量很少时，不算失败
         """
-        # 目标页数随机化（更像真人）
         if max_pages < min_pages:
             max_pages = min_pages
         target_pages = random.randint(min_pages, max_pages)
-
         logger.info(f"目标：浏览评论 {target_pages} 页（批次）")
 
-        # 1) 确保回复流 ready
-        self.wait_topic_posts_ready(page, timeout=40)
+        ready = self.wait_topic_posts_ready(page, timeout=55)
+        if not ready:
+            logger.warning("帖子流未确认 ready，但继续尝试滚动浏览（不中断）")
 
-        # 2) 像人停顿一下
-        time.sleep(random.uniform(1.5, 3.0))
+        time.sleep(random.uniform(1.2, 2.5))
 
         pages_done = 0
         last_post_no = self._current_post_number(page)
+        last_cnt = self._topic_article_count(page)
+
         if last_post_no:
-            logger.info(f"初始时间轴楼层号: #{last_post_no}")
+            logger.info(f"初始楼层号: #{last_post_no}")
         else:
-            logger.info("初始未能读取楼层号（仍继续浏览）")
+            logger.info(f"初始未读到楼层号，fallback 用帖子数计页；初始帖子数={last_cnt}")
 
-        # 防止死循环：最多尝试次数
-        max_loops = target_pages * 6 + 12
-
+        max_loops = target_pages * 7 + 14
         for i in range(max_loops):
-            # 分段滚动（更像“翻页/刷评论”）
-            scroll_distance = random.randint(900, 1400)
+            scroll_distance = random.randint(900, 1500)
             logger.info(f"[loop {i+1}] 向下滚动 {scroll_distance}px 浏览评论...")
             page.run_js(f"window.scrollBy(0, {scroll_distance});")
 
-            # 小等待让前端触发加载
             time.sleep(random.uniform(0.8, 1.6))
-
-            # 关键：等右侧时间轴稳定（你说的蓝点不再变化/加载完成）
             self.wait_topic_progress_stable(
                 page,
-                stable_seconds=random.uniform(2.0, 3.2),
+                stable_seconds=random.uniform(1.8, 3.0),
                 timeout=25
             )
 
-            # 读取当前楼层号
-            cur_post_no = self._current_post_number(page)
+            # 判断到底
+            try:
+                at_bottom = page.run_js(
+                    "return (window.scrollY + window.innerHeight) >= (document.body.scrollHeight - 5);"
+                )
+            except Exception:
+                at_bottom = False
 
-            # 判断是否“翻到下一页/批次”
+            # 1) 楼层号计页（优先）
+            cur_post_no = self._current_post_number(page)
             if cur_post_no and last_post_no and cur_post_no > last_post_no:
                 pages_done += 1
                 logger.success(
                     f"✅ 已浏览第 {pages_done}/{target_pages} 页（楼层 #{last_post_no} -> #{cur_post_no}）"
                 )
                 last_post_no = cur_post_no
-
-                # 翻页后多停留：像在读这一屏评论
                 time.sleep(random.uniform(3.5, 8.0))
             else:
-                # 没翻页也停留：像在读已加载的评论
-                time.sleep(random.uniform(2.0, 5.0))
+                # 2) fallback：帖子数增长计页
+                cur_cnt = self._topic_article_count(page)
+                if cur_cnt - last_cnt >= PAGE_POST_GROW:
+                    pages_done += 1
+                    logger.success(
+                        f"✅ 已浏览第 {pages_done}/{target_pages} 页（帖子数 {last_cnt} -> {cur_cnt}）"
+                    )
+                    last_cnt = cur_cnt
+                    time.sleep(random.uniform(3.0, 7.0))
+                else:
+                    time.sleep(random.uniform(2.0, 5.0))
 
             if pages_done >= target_pages:
                 logger.success("🎉 已达到目标评论页数，结束浏览")
                 return True
 
-            # 到底部退出
-            try:
-                at_bottom = page.run_js(
-                    "return (window.scrollY + window.innerHeight) >= (document.body.scrollHeight - 5);"
-                )
-                if at_bottom:
-                    logger.success("已到达页面底部，结束浏览")
-                    return pages_done >= min_pages
-            except Exception:
-                pass
+            if at_bottom:
+                total_cnt = self._topic_article_count(page)
+                logger.success("已到达页面底部，结束浏览")
+
+                # 短帖容错：总量太少就放宽最小页数
+                if total_cnt <= (min_pages * PAGE_POST_GROW + 5):
+                    logger.info(f"该主题较短（总帖子数={total_cnt}），放宽最小页数要求，视为完成")
+                    return True
+                return pages_done >= min_pages
 
         logger.warning("达到最大循环次数仍未完成目标页数（可能加载慢/结构变化）")
         return pages_done >= min_pages
@@ -450,7 +536,6 @@ class LinuxDoBrowser:
     # Browse from latest list
     # ----------------------------
     def click_topic(self):
-        # 确保在列表页
         if not self.page.url.startswith("https://linux.do/latest"):
             self.page.get(LIST_URL)
 
@@ -467,8 +552,10 @@ class LinuxDoBrowser:
             logger.error((self.page.html or "")[:500])
             return False
 
-        logger.info(f"发现 {len(topic_links)} 个主题帖，随机选择50个")
-        for a in random.sample(topic_links, min(50, len(topic_links))):
+        count = min(MAX_TOPICS, len(topic_links))
+        logger.info(f"发现 {len(topic_links)} 个主题帖，随机选择 {count} 个进行浏览")
+
+        for a in random.sample(topic_links, count):
             href = a.attr("href")
             if not href:
                 continue
@@ -484,16 +571,15 @@ class LinuxDoBrowser:
         try:
             new_page.get(topic_url)
 
-            # 先等回复/评论流 ready + 时间轴稳定
-            self.wait_topic_posts_ready(new_page, timeout=40)
-            time.sleep(random.uniform(1.2, 2.5))
+            # 先等评论真实渲染 + 时间轴稳定
+            self.wait_topic_posts_ready(new_page, timeout=55)
+            time.sleep(random.uniform(1.0, 2.0))
             self.wait_topic_progress_stable(new_page, stable_seconds=2.2, timeout=25)
 
             # 点赞（可选）
             if random.random() < 0.3:
                 self.click_like(new_page)
 
-            # ✅ 关键：至少浏览 5~10 页评论（按右侧楼层号增长计页）
             ok = self.browse_replies_pages(
                 new_page,
                 min_pages=MIN_COMMENT_PAGES,
@@ -501,7 +587,6 @@ class LinuxDoBrowser:
             )
             if not ok:
                 logger.warning("本主题未达到最小评论页数目标（可能帖子很短/到底/加载慢）")
-
         finally:
             try:
                 new_page.close()
@@ -587,7 +672,9 @@ class LinuxDoBrowser:
     def send_notifications(self, browse_enabled):
         status_msg = f"✅每日登录成功: {USERNAME}"
         if browse_enabled:
-            status_msg += f" + 浏览任务完成(含评论{MIN_COMMENT_PAGES}-{MAX_COMMENT_PAGES}页)"
+            status_msg += (
+                f" + 浏览任务完成(话题<= {MAX_TOPICS} 个, 评论{MIN_COMMENT_PAGES}-{MAX_COMMENT_PAGES}页)"
+            )
 
         if GOTIFY_URL and GOTIFY_TOKEN:
             try:
