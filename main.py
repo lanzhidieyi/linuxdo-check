@@ -72,16 +72,18 @@ PAGE_GROW = int(os.environ.get("PAGE_GROW", "10"))
 # 点赞概率（0~1）
 LIKE_PROB = float(os.environ.get("LIKE_PROB", "0.3"))
 
-# 浏览每页后的停留时间范围（秒）
-READ_SLEEP_MIN = float(os.environ.get("READ_SLEEP_MIN", "3.5"))
-READ_SLEEP_MAX = float(os.environ.get("READ_SLEEP_MAX", "8.0"))
-
-# 每次滚动距离
+# 滚动距离（像真人滚动）
 SCROLL_MIN = int(os.environ.get("SCROLL_MIN", "900"))
 SCROLL_MAX = int(os.environ.get("SCROLL_MAX", "1500"))
 
 # 每个话题最多滚动循环次数倍率（避免死循环）
 MAX_LOOP_FACTOR = float(os.environ.get("MAX_LOOP_FACTOR", "8"))
+
+# 每楼“有效浏览”最少停留秒数（蓝点约 5 秒消失）
+MIN_READ_STAY = float(os.environ.get("MIN_READ_STAY", "5"))
+
+# 等待 read-state 变 read 的最长时间（秒）
+READ_STATE_TIMEOUT = float(os.environ.get("READ_STATE_TIMEOUT", "20"))
 
 GOTIFY_URL = os.environ.get("GOTIFY_URL")
 GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")
@@ -359,8 +361,85 @@ class LinuxDoBrowser:
         except Exception:
             return 0
 
-    def linger_on_random_posts(self, page, k_min=1, k_max=3):
-        """随机停留在若干楼正文处，模拟阅读"""
+    # ----------------------------
+    # Read-state / Blue-dot helpers (精准适配你给的 DOM)
+    # ----------------------------
+    def _post_is_read(self, page, post_id: int) -> bool:
+        """
+        精准判定：该楼是否已读
+        以你给的结构为准：#post_x ... .read-state.read > svg
+        """
+        try:
+            return bool(
+                page.run_js(
+                    r"""
+                    const pid = arguments[0];
+                    const root = document.querySelector(`#post_${pid}`);
+                    if (!root) return false;
+                    const read = root.querySelector('.topic-meta-data .read-state.read');
+                    return !!read;
+                    """,
+                    post_id,
+                )
+            )
+        except Exception:
+            return False
+
+    def _post_has_blue_dot(self, page, post_id: int) -> bool:
+        """
+        判定：该楼是否仍是“未读/需要停留”的状态（蓝点还在）
+        逻辑：存在 .read-state 但不是 .read 即认为未读
+        """
+        try:
+            return bool(
+                page.run_js(
+                    r"""
+                    const pid = arguments[0];
+                    const root = document.querySelector(`#post_${pid}`);
+                    if (!root) return false;
+                    const rs = root.querySelector('.topic-meta-data .read-state');
+                    if (!rs) return false;
+                    return !rs.classList.contains('read');
+                    """,
+                    post_id,
+                )
+            )
+        except Exception:
+            return False
+
+    def wait_blue_dot_gone(self, page, post_id: int, min_stay=5.0, timeout=20.0) -> bool:
+        """
+        把某楼滚到视口中间，至少停留 min_stay 秒，
+        并等待其 read-state 变成 .read（蓝点消失/计入已读）。
+        """
+        try:
+            page.run_js(
+                r"""
+                const pid = arguments[0];
+                const el = document.querySelector(`#post_${pid}`);
+                if (el) el.scrollIntoView({behavior:'instant', block:'center'});
+                """,
+                post_id,
+            )
+        except Exception:
+            pass
+
+        # 最少停留（你观测大概 5 秒）
+        time.sleep(min_stay)
+
+        if self._post_is_read(page, post_id):
+            return True
+
+        end = time.time() + timeout
+        while time.time() < end:
+            if self._post_is_read(page, post_id):
+                return True
+            time.sleep(0.6)
+
+        return False
+
+    def linger_on_random_posts(self, page, k_min=1, k_max=2):
+        """随机选几楼停留阅读：每楼至少 MIN_READ_STAY 秒，并尽量等蓝点变成 read"""
         k = random.randint(k_min, k_max)
         for _ in range(k):
             try:
@@ -369,20 +448,22 @@ class LinuxDoBrowser:
                     const posts = Array.from(document.querySelectorAll('[id^="post_"]'));
                     if (!posts.length) return null;
                     const el = posts[Math.floor(Math.random() * posts.length)];
-                    return el.id;
+                    const m = el.id.match(/^post_(\d+)$/);
+                    return m ? parseInt(m[1], 10) : null;
                     """
                 )
                 if not pid:
                     return
-                page.run_js(
-                    f"""
-                    const id = arguments[0];
-                    const el = document.querySelector('#' + id + ' {POST_CONTENT_CSS}');
-                    if (el) el.scrollIntoView({{behavior:'instant', block:'center'}});
-                    """,
-                    pid,
-                )
-                time.sleep(random.uniform(2.5, 6.5))
+
+                if self._post_is_read(page, pid):
+                    time.sleep(random.uniform(1.5, 3.0))
+                else:
+                    self.wait_blue_dot_gone(
+                        page,
+                        pid,
+                        min_stay=MIN_READ_STAY,
+                        timeout=READ_STATE_TIMEOUT,
+                    )
             except Exception:
                 pass
 
@@ -393,11 +474,14 @@ class LinuxDoBrowser:
         """
         至少浏览 min_pages 页，最多 max_pages 页
         “页”的定义：最大楼层号 max_post_no 有明显增长（默认增长 PAGE_GROW 计 1 页）
+        翻页后会随机“有效阅读”1~2楼（至少停留5秒，等待 read-state 变 read）
         """
         if max_pages < min_pages:
             max_pages = min_pages
         target_pages = random.randint(min_pages, max_pages)
-        logger.info(f"目标：浏览评论 {target_pages} 页（按楼层号增长计，PAGE_GROW={PAGE_GROW}）")
+        logger.info(
+            f"目标：浏览评论 {target_pages} 页（按楼层号增长计，PAGE_GROW={PAGE_GROW}）"
+        )
 
         self.wait_topic_posts_ready(page, timeout=55)
 
@@ -428,14 +512,13 @@ class LinuxDoBrowser:
                 last_max_no = cur_max_no
                 last_cnt = cur_cnt
 
-                # 翻页后：随机停留几楼模拟阅读
+                # 翻页后：有效阅读几楼（蓝点会变 read）
                 self.linger_on_random_posts(page, k_min=1, k_max=2)
 
-                # 再额外读一会
-                time.sleep(random.uniform(READ_SLEEP_MIN, READ_SLEEP_MAX))
+                # 额外小停顿（可选）
+                time.sleep(random.uniform(0.6, 1.8))
             else:
-                # 没翻页也停留：像在读当前屏
-                time.sleep(random.uniform(2.0, 5.0))
+                time.sleep(random.uniform(1.8, 4.5))
 
             if pages_done >= target_pages:
                 logger.success("🎉 已达到目标评论页数，结束浏览")
@@ -512,7 +595,7 @@ class LinuxDoBrowser:
             ok = self.browse_replies_pages(
                 new_page,
                 min_pages=MIN_COMMENT_PAGES,
-                max_pages=MAX_COMMENT_PAGES
+                max_pages=MAX_COMMENT_PAGES,
             )
             if not ok:
                 logger.warning("本主题未达到最小评论页数目标（可能帖子很短/到底/加载慢）")
@@ -538,33 +621,6 @@ class LinuxDoBrowser:
                 logger.info("帖子可能已经点过赞了")
         except Exception as e:
             logger.error(f"点赞失败: {str(e)}")
-
-    # ----------------------------
-    # Run
-    # ----------------------------
-    def run(self):
-        try:
-            login_res = self.login()
-            if not login_res:
-                logger.warning("登录失败，后续任务可能无法进行")
-
-            if BROWSE_ENABLED:
-                click_topic_res = self.click_topic()
-                if not click_topic_res:
-                    logger.error("点击主题失败，程序终止")
-                    return
-                logger.info("完成浏览任务（含评论浏览）")
-
-            self.send_notifications(BROWSE_ENABLED)
-        finally:
-            try:
-                self.page.close()
-            except Exception:
-                pass
-            try:
-                self.browser.quit()
-            except Exception:
-                pass
 
     # ----------------------------
     # Connect info
@@ -603,7 +659,8 @@ class LinuxDoBrowser:
         status_msg = f"✅每日登录成功: {USERNAME}"
         if browse_enabled:
             status_msg += (
-                f" + 浏览任务完成(话题<= {MAX_TOPICS} 个, 评论{MIN_COMMENT_PAGES}-{MAX_COMMENT_PAGES}页, PAGE_GROW={PAGE_GROW})"
+                f" + 浏览任务完成(话题<= {MAX_TOPICS} 个, 评论{MIN_COMMENT_PAGES}-{MAX_COMMENT_PAGES}页, "
+                f"PAGE_GROW={PAGE_GROW}, MIN_READ_STAY={MIN_READ_STAY}s)"
             )
 
         if GOTIFY_URL and GOTIFY_TOKEN:
@@ -662,6 +719,33 @@ class LinuxDoBrowser:
                 logger.error(f"wxpush 推送失败: {str(e)}")
         else:
             logger.info("未配置 WXPUSH_URL 或 WXPUSH_TOKEN，跳过通知发送")
+
+    # ----------------------------
+    # Run
+    # ----------------------------
+    def run(self):
+        try:
+            login_res = self.login()
+            if not login_res:
+                logger.warning("登录失败，后续任务可能无法进行")
+
+            if BROWSE_ENABLED:
+                click_topic_res = self.click_topic()
+                if not click_topic_res:
+                    logger.error("点击主题失败，程序终止")
+                    return
+                logger.info("完成浏览任务（含评论浏览）")
+
+            self.send_notifications(BROWSE_ENABLED)
+        finally:
+            try:
+                self.page.close()
+            except Exception:
+                pass
+            try:
+                self.browser.quit()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
