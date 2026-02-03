@@ -72,10 +72,6 @@ PAGE_GROW = int(os.environ.get("PAGE_GROW", "10"))
 # 点赞概率（0~1）
 LIKE_PROB = float(os.environ.get("LIKE_PROB", "0.3"))
 
-# 滚动距离（像真人滚动）
-SCROLL_MIN = int(os.environ.get("SCROLL_MIN", "900"))
-SCROLL_MAX = int(os.environ.get("SCROLL_MAX", "1500"))
-
 # 每个话题最多滚动循环次数倍率（避免死循环）
 MAX_LOOP_FACTOR = float(os.environ.get("MAX_LOOP_FACTOR", "8"))
 
@@ -84,6 +80,9 @@ MIN_READ_STAY = float(os.environ.get("MIN_READ_STAY", "5"))
 
 # 等待 read-state 变 read 的最长时间（秒）
 READ_STATE_TIMEOUT = float(os.environ.get("READ_STATE_TIMEOUT", "20"))
+
+# 接近底部触发加载的等待时间（秒）
+NEAR_BOTTOM_WAIT_TIMEOUT = float(os.environ.get("NEAR_BOTTOM_WAIT_TIMEOUT", "22"))
 
 GOTIFY_URL = os.environ.get("GOTIFY_URL")
 GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")
@@ -362,12 +361,44 @@ class LinuxDoBrowser:
             return 0
 
     # ----------------------------
+    # Near-bottom trigger loading (整合版)
+    # ----------------------------
+    def scroll_near_bottom(self, page):
+        """滚到接近底部（90%~95%），更容易触发加载下一批评论"""
+        try:
+            page.run_js(
+                r"""
+                const h = document.body.scrollHeight;
+                const ratio = 0.90 + Math.random() * 0.05;
+                window.scrollTo(0, Math.floor(h * ratio));
+                """
+            )
+        except Exception:
+            pass
+
+    def wait_max_post_grow(self, page, last_max_no: int, need_grow: int, timeout=22) -> int:
+        """
+        等待 max_post_no 增长（至少增长 need_grow 或有增长）
+        返回当前观测到的最大楼层号
+        """
+        end = time.time() + timeout
+        best = last_max_no
+        while time.time() < end:
+            cur = self._max_post_number_in_dom(page)
+            if cur > best:
+                best = cur
+            if cur - last_max_no >= need_grow:
+                return cur
+            time.sleep(0.6)
+        return best
+
+    # ----------------------------
     # Read-state / Blue-dot helpers (精准适配你给的 DOM)
     # ----------------------------
     def _post_is_read(self, page, post_id: int) -> bool:
         """
         精准判定：该楼是否已读
-        以你给的结构为准：#post_x ... .read-state.read > svg
+        结构：#post_x ... .topic-meta-data .read-state.read
         """
         try:
             return bool(
@@ -378,28 +409,6 @@ class LinuxDoBrowser:
                     if (!root) return false;
                     const read = root.querySelector('.topic-meta-data .read-state.read');
                     return !!read;
-                    """,
-                    post_id,
-                )
-            )
-        except Exception:
-            return False
-
-    def _post_has_blue_dot(self, page, post_id: int) -> bool:
-        """
-        判定：该楼是否仍是“未读/需要停留”的状态（蓝点还在）
-        逻辑：存在 .read-state 但不是 .read 即认为未读
-        """
-        try:
-            return bool(
-                page.run_js(
-                    r"""
-                    const pid = arguments[0];
-                    const root = document.querySelector(`#post_${pid}`);
-                    if (!root) return false;
-                    const rs = root.querySelector('.topic-meta-data .read-state');
-                    if (!rs) return false;
-                    return !rs.classList.contains('read');
                     """,
                     post_id,
                 )
@@ -424,7 +433,6 @@ class LinuxDoBrowser:
         except Exception:
             pass
 
-        # 最少停留（你观测大概 5 秒）
         time.sleep(min_stay)
 
         if self._post_is_read(page, post_id):
@@ -439,7 +447,7 @@ class LinuxDoBrowser:
         return False
 
     def linger_on_random_posts(self, page, k_min=1, k_max=2):
-        """随机选几楼停留阅读：每楼至少 MIN_READ_STAY 秒，并尽量等蓝点变成 read"""
+        """随机选几楼停留阅读：每楼至少 MIN_READ_STAY 秒，并尽量等 read-state 变 read"""
         k = random.randint(k_min, k_max)
         for _ in range(k):
             try:
@@ -454,27 +462,25 @@ class LinuxDoBrowser:
                 )
                 if not pid:
                     return
-
-                if self._post_is_read(page, pid):
-                    time.sleep(random.uniform(1.5, 3.0))
-                else:
-                    self.wait_blue_dot_gone(
-                        page,
-                        pid,
-                        min_stay=MIN_READ_STAY,
-                        timeout=READ_STATE_TIMEOUT,
-                    )
+                self.wait_blue_dot_gone(
+                    page,
+                    pid,
+                    min_stay=MIN_READ_STAY,
+                    timeout=READ_STATE_TIMEOUT,
+                )
             except Exception:
                 pass
 
     # ----------------------------
-    # Browse replies (5-10 pages)
+    # Browse replies (5-10 pages)  —— 已整合“接近底部触发加载”
     # ----------------------------
     def browse_replies_pages(self, page, min_pages=5, max_pages=10):
         """
         至少浏览 min_pages 页，最多 max_pages 页
         “页”的定义：最大楼层号 max_post_no 有明显增长（默认增长 PAGE_GROW 计 1 页）
         翻页后会随机“有效阅读”1~2楼（至少停留5秒，等待 read-state 变 read）
+
+        ✅ 滚动策略：每轮直接滚到接近底部(90~95%)，触发加载下一批评论
         """
         if max_pages < min_pages:
             max_pages = min_pages
@@ -493,17 +499,18 @@ class LinuxDoBrowser:
         max_loops = int(target_pages * MAX_LOOP_FACTOR + 16)
 
         for i in range(max_loops):
-            scroll_distance = random.randint(SCROLL_MIN, SCROLL_MAX)
-            logger.info(f"[loop {i+1}] 向下滚动 {scroll_distance}px 浏览评论...")
-            page.run_js(f"window.scrollBy(0, {scroll_distance});")
+            logger.info(f"[loop {i+1}] 滚到接近底部以触发加载更多评论...")
+            self.scroll_near_bottom(page)
 
-            # 等待加载/渲染
-            time.sleep(random.uniform(1.2, 2.2))
-
-            cur_max_no = self._max_post_number_in_dom(page)
+            # 等待 max_post_no 增长（更像“真的加载到更多回复”）
+            cur_max_no = self.wait_max_post_grow(
+                page,
+                last_max_no,
+                need_grow=PAGE_GROW,
+                timeout=NEAR_BOTTOM_WAIT_TIMEOUT,
+            )
             cur_cnt = self._post_count_in_dom(page)
 
-            # “翻页”：楼层号增长够多
             if cur_max_no - last_max_no >= PAGE_GROW:
                 pages_done += 1
                 logger.success(
@@ -515,10 +522,10 @@ class LinuxDoBrowser:
                 # 翻页后：有效阅读几楼（蓝点会变 read）
                 self.linger_on_random_posts(page, k_min=1, k_max=2)
 
-                # 额外小停顿（可选）
                 time.sleep(random.uniform(0.6, 1.8))
             else:
-                time.sleep(random.uniform(1.8, 4.5))
+                # 没翻页：小停留后再来一次（可能还没触发加载阈值）
+                time.sleep(random.uniform(1.2, 2.8))
 
             if pages_done >= target_pages:
                 logger.success("🎉 已达到目标评论页数，结束浏览")
@@ -534,7 +541,6 @@ class LinuxDoBrowser:
 
             if at_bottom:
                 logger.success("已到达页面底部，结束浏览")
-                # 短帖容错：楼层总量不足以翻够 min_pages 时，不算失败
                 if cur_max_no <= (min_pages * PAGE_GROW + 5):
                     logger.info(
                         f"主题较短（max_post_no≈{cur_max_no}），放宽最小页数要求，视为完成"
@@ -584,11 +590,9 @@ class LinuxDoBrowser:
         try:
             new_page.get(topic_url)
 
-            # 确保评论渲染出来
             self.wait_topic_posts_ready(new_page, timeout=55)
             time.sleep(random.uniform(1.0, 2.0))
 
-            # 点赞（可选）
             if random.random() < LIKE_PROB:
                 self.click_like(new_page)
 
@@ -660,7 +664,7 @@ class LinuxDoBrowser:
         if browse_enabled:
             status_msg += (
                 f" + 浏览任务完成(话题<= {MAX_TOPICS} 个, 评论{MIN_COMMENT_PAGES}-{MAX_COMMENT_PAGES}页, "
-                f"PAGE_GROW={PAGE_GROW}, MIN_READ_STAY={MIN_READ_STAY}s)"
+                f"PAGE_GROW={PAGE_GROW}, MIN_READ_STAY={MIN_READ_STAY}s, near-bottom=on)"
             )
 
         if GOTIFY_URL and GOTIFY_TOKEN:
