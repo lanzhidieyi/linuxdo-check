@@ -98,7 +98,7 @@ LOGIN_URL = "https://linux.do/login"
 SESSION_URL = "https://linux.do/session"
 CSRF_URL = "https://linux.do/session/csrf"
 
-# 你提供的帖子结构关键选择器（用于确认评论/回复已渲染）
+# 帖子结构关键选择器
 POST_CONTENT_CSS = "div.post__regular.regular.post__contents.contents"
 POST_META_CSS = "div.topic-meta-data"
 
@@ -297,35 +297,68 @@ class LinuxDoBrowser:
         return False
 
     # ----------------------------
-    # Topic/Posts helpers (基于 #post_x 结构)
+    # Topic/Posts helpers (适配：不一定从 #post_1 开始)
     # ----------------------------
-    def wait_topic_posts_ready(self, page, timeout=55) -> bool:
+    def wait_topic_posts_ready(self, page, timeout=70) -> bool:
         """
-        等主题页评论/回复渲染完成：
-        - #post_1 存在
-        - #post_1 内的正文区域存在且有文本
+        适配 Discourse：可能从上次阅读位置进入（不一定有 #post_1）
+        ready 条件：
+        - DOM 里出现任意 #post_x
+        - 且任意一个 post 的正文区域存在并有文本
+        同时输出当前落点楼层范围，便于排查。
         """
         end = time.time() + timeout
+        last_log = 0
+
         while time.time() < end:
             try:
-                ok = page.run_js(
+                res = page.run_js(
                     f"""
-                    const p = document.querySelector('#post_1');
-                    if (!p) return false;
-                    const c = p.querySelector('{POST_CONTENT_CSS}');
-                    if (!c) return false;
-                    const t = (c.innerText || c.textContent || '').trim();
-                    return t.length > 0;
+                    const posts = Array.from(document.querySelectorAll('[id^="post_"]'));
+                    if (!posts.length) return null;
+
+                    let minN = 1e9, maxN = 0, ok = false;
+
+                    for (const p of posts) {{
+                      const m = p.id.match(/^post_(\\d+)$/);
+                      if (m) {{
+                        const n = parseInt(m[1], 10);
+                        if (n < minN) minN = n;
+                        if (n > maxN) maxN = n;
+                      }}
+                      const c = p.querySelector('{POST_CONTENT_CSS}');
+                      if (!c) continue;
+                      const t = (c.innerText || c.textContent || '').trim();
+                      if (t.length > 0) ok = true;
+                    }}
+
+                    return {{ ok, minN, maxN, count: posts.length }};
                     """
                 )
-                if ok:
+
+                if res and res.get("ok"):
+                    logger.info(
+                        f"帖子流已渲染：dom_posts={res.get('count')} "
+                        f"range=post_{res.get('minN')}..post_{res.get('maxN')}"
+                    )
                     time.sleep(random.uniform(0.8, 1.6))
                     return True
+
+                # 每 5 秒打印一次当前状态（避免刷屏）
+                if time.time() - last_log > 5:
+                    last_log = time.time()
+                    if res:
+                        logger.info(
+                            f"等待渲染中：dom_posts={res.get('count')} "
+                            f"range=post_{res.get('minN')}..post_{res.get('maxN')}"
+                        )
+
             except Exception:
                 pass
-            time.sleep(0.5)
 
-        logger.warning("未等到 #post_1 正文渲染完成（可能结构变化/加载慢）")
+            time.sleep(0.6)
+
+        logger.warning("未等到帖子流正文渲染完成（可能结构变化/加载慢/被拦截）")
         return False
 
     def _max_post_number_in_dom(self, page) -> int:
@@ -407,6 +440,37 @@ class LinuxDoBrowser:
         except Exception:
             return False
 
+    def pick_unread_post_ids(self, page, limit=2):
+        """
+        从当前 DOM 找“仍有蓝点/未读”的楼层号，随机取 limit 个
+        """
+        try:
+            ids = page.run_js(
+                r"""
+                const out = [];
+                document.querySelectorAll('[id^="post_"]').forEach(root => {
+                  const m = root.id.match(/^post_(\d+)$/);
+                  if (!m) return;
+                  const rs = root.querySelector('.topic-meta-data .read-state');
+                  if (!rs) return;
+                  if (!rs.classList.contains('read')) out.push(parseInt(m[1], 10));
+                });
+
+                // shuffle
+                for (let i = out.length - 1; i > 0; i--) {
+                  const j = Math.floor(Math.random() * (i + 1));
+                  [out[i], out[j]] = [out[j], out[i]];
+                }
+                return out;
+                """
+            )
+            if not ids:
+                return []
+            ids = [int(x) for x in ids if str(x).isdigit()]
+            return ids[:limit] if limit else ids
+        except Exception:
+            return []
+
     def wait_blue_dot_gone(self, page, post_id: int, min_stay=5.0, timeout=20.0) -> bool:
         """
         把某楼滚到视口中间，至少停留 min_stay 秒，
@@ -439,33 +503,28 @@ class LinuxDoBrowser:
         return False
 
     def linger_on_random_posts(self, page, k_min=1, k_max=2):
-        """随机选几楼停留阅读：每楼至少 MIN_READ_STAY 秒，并尽量等蓝点变成 read"""
+        """
+        只读“仍有蓝点”的楼层；已读楼层直接跳过
+        每楼至少 MIN_READ_STAY 秒，并尽量等 read-state 变 read
+        """
         k = random.randint(k_min, k_max)
-        for _ in range(k):
-            try:
-                pid = page.run_js(
-                    r"""
-                    const posts = Array.from(document.querySelectorAll('[id^="post_"]'));
-                    if (!posts.length) return null;
-                    const el = posts[Math.floor(Math.random() * posts.length)];
-                    const m = el.id.match(/^post_(\d+)$/);
-                    return m ? parseInt(m[1], 10) : null;
-                    """
-                )
-                if not pid:
-                    return
 
-                if self._post_is_read(page, pid):
-                    time.sleep(random.uniform(1.5, 3.0))
-                else:
-                    self.wait_blue_dot_gone(
-                        page,
-                        pid,
-                        min_stay=MIN_READ_STAY,
-                        timeout=READ_STATE_TIMEOUT,
-                    )
-            except Exception:
-                pass
+        unread_ids = self.pick_unread_post_ids(page, limit=k)
+        if not unread_ids:
+            logger.info("本页未发现仍有蓝点的楼层（可能都已读），跳过有效阅读")
+            return
+
+        for pid in unread_ids:
+            ok = self.wait_blue_dot_gone(
+                page,
+                pid,
+                min_stay=MIN_READ_STAY,
+                timeout=READ_STATE_TIMEOUT,
+            )
+            if ok:
+                logger.success(f"✅ 已读：post_{pid}")
+            else:
+                logger.warning(f"⚠️ 等待已读超时：post_{pid}（但已停留≥{MIN_READ_STAY}s）")
 
     # ----------------------------
     # Browse replies (5-10 pages)
@@ -474,7 +533,7 @@ class LinuxDoBrowser:
         """
         至少浏览 min_pages 页，最多 max_pages 页
         “页”的定义：最大楼层号 max_post_no 有明显增长（默认增长 PAGE_GROW 计 1 页）
-        翻页后会随机“有效阅读”1~2楼（至少停留5秒，等待 read-state 变 read）
+        翻页后会“有效阅读”未读楼层（只读仍有蓝点的楼层）
         """
         if max_pages < min_pages:
             max_pages = min_pages
@@ -483,7 +542,7 @@ class LinuxDoBrowser:
             f"目标：浏览评论 {target_pages} 页（按楼层号增长计，PAGE_GROW={PAGE_GROW}）"
         )
 
-        self.wait_topic_posts_ready(page, timeout=55)
+        self.wait_topic_posts_ready(page, timeout=70)
 
         pages_done = 0
         last_max_no = self._max_post_number_in_dom(page)
@@ -512,7 +571,7 @@ class LinuxDoBrowser:
                 last_max_no = cur_max_no
                 last_cnt = cur_cnt
 
-                # 翻页后：有效阅读几楼（蓝点会变 read）
+                # 翻页后：有效阅读未读楼层（只读蓝点楼层）
                 self.linger_on_random_posts(page, k_min=1, k_max=2)
 
                 # 额外小停顿（可选）
@@ -584,8 +643,8 @@ class LinuxDoBrowser:
         try:
             new_page.get(topic_url)
 
-            # 确保评论渲染出来
-            self.wait_topic_posts_ready(new_page, timeout=55)
+            # 确保评论渲染出来（不强制 #post_1）
+            self.wait_topic_posts_ready(new_page, timeout=70)
             time.sleep(random.uniform(1.0, 2.0))
 
             # 点赞（可选）
@@ -660,7 +719,7 @@ class LinuxDoBrowser:
         if browse_enabled:
             status_msg += (
                 f" + 浏览任务完成(话题<= {MAX_TOPICS} 个, 评论{MIN_COMMENT_PAGES}-{MAX_COMMENT_PAGES}页, "
-                f"PAGE_GROW={PAGE_GROW}, MIN_READ_STAY={MIN_READ_STAY}s)"
+                f"PAGE_GROW={PAGE_GROW}, MIN_READ_STAY={MIN_READ_STAY}s, 只读蓝点楼层)"
             )
 
         if GOTIFY_URL and GOTIFY_TOKEN:
