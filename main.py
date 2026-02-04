@@ -8,6 +8,7 @@ import random
 import time
 import functools
 import re
+import urllib.parse
 from loguru import logger
 from DrissionPage import ChromiumOptions, Chromium
 from tabulate import tabulate
@@ -15,6 +16,9 @@ from curl_cffi import requests
 from bs4 import BeautifulSoup
 
 
+# ----------------------------
+# Retry Decorator
+# ----------------------------
 def retry_decorator(retries=3, min_delay=5, max_delay=10):
     def decorator(func):
         @functools.wraps(func)
@@ -60,20 +64,18 @@ MAX_TOPICS = int(os.environ.get("MAX_TOPICS", "50"))
 
 MIN_COMMENT_PAGES = int(os.environ.get("MIN_COMMENT_PAGES", "5"))
 MAX_COMMENT_PAGES = int(os.environ.get("MAX_COMMENT_PAGES", "10"))
+
 PAGE_GROW = int(os.environ.get("PAGE_GROW", "10"))
 
 LIKE_PROB = float(os.environ.get("LIKE_PROB", "0.3"))
 
-# ✅ 改这里：小步滚动改成 1000 左右
+# 你反馈 1000 左右合适
 STEP_SCROLL_MIN = int(os.environ.get("STEP_SCROLL_MIN", "900"))
 STEP_SCROLL_MAX = int(os.environ.get("STEP_SCROLL_MAX", "1400"))
 
-# 你要求写死
-MIN_READ_STAY = 5.0
-READ_STATE_TIMEOUT = 20.0
-
-VIEWPORT_STAY_MIN = float(os.environ.get("VIEWPORT_STAY_MIN", "5.6"))
-VIEWPORT_STAY_MAX = float(os.environ.get("VIEWPORT_STAY_MAX", "7.2"))
+# 停留时间上调
+VIEWPORT_STAY_MIN = float(os.environ.get("VIEWPORT_STAY_MIN", "6.5"))
+VIEWPORT_STAY_MAX = float(os.environ.get("VIEWPORT_STAY_MAX", "8.5"))
 
 MAX_LOOP_FACTOR = float(os.environ.get("MAX_LOOP_FACTOR", "10"))
 
@@ -81,6 +83,13 @@ STALL_LIMIT = int(os.environ.get("STALL_LIMIT", "8"))
 NEAR_BOTTOM_WAIT_TIMEOUT = float(os.environ.get("NEAR_BOTTOM_WAIT_TIMEOUT", "18"))
 
 TIMINGS_VISIBLE_LIMIT = int(os.environ.get("TIMINGS_VISIBLE_LIMIT", "10"))
+
+# 你要求固定
+MIN_READ_STAY = 5.0
+READ_STATE_TIMEOUT = 20.0
+
+# ✅ 新增：timings 提交最小间隔（避免过于频繁触发 CF 风控）
+TIMINGS_POST_MIN_INTERVAL = float(os.environ.get("TIMINGS_POST_MIN_INTERVAL", "20"))
 
 GOTIFY_URL = os.environ.get("GOTIFY_URL")
 GOTIFY_TOKEN = os.environ.get("GOTIFY_TOKEN")
@@ -93,7 +102,6 @@ HOME_FOR_COOKIE = "https://linux.do/"
 LOGIN_URL = "https://linux.do/login"
 SESSION_URL = "https://linux.do/session"
 CSRF_URL = "https://linux.do/session/csrf"
-TOPICS_TIMINGS_URL = "https://linux.do/topics/timings"
 
 POST_CONTENT_CSS = "div.post__regular.regular.post__contents.contents"
 
@@ -118,6 +126,7 @@ class LinuxDoBrowser:
             .set_argument("--no-sandbox")
         )
 
+        # 尽量避免后台节流（否则“停留计时”不稳定）
         co.set_argument("--disable-background-timer-throttling")
         co.set_argument("--disable-backgrounding-occluded-windows")
         co.set_argument("--disable-renderer-backgrounding")
@@ -138,27 +147,34 @@ class LinuxDoBrowser:
             }
         )
 
-        self.csrf_token = None
+        # ✅ 每个 topic 单独节流：上一次 timings 提交时间
+        self._last_timings_post_at = 0.0
 
-    def _api_headers(self, referer=LOGIN_URL):
+    # ----------------------------
+    # Headers
+    # ----------------------------
+    def _api_headers(self):
         return {
             "User-Agent": self.session.headers.get("User-Agent"),
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Accept-Language": "zh-CN,zh;q=0.9",
             "X-Requested-With": "XMLHttpRequest",
-            "Referer": referer,
+            "Referer": LOGIN_URL,
             "Origin": "https://linux.do",
         }
 
-    def _html_headers(self, referer=HOME_FOR_COOKIE):
+    def _html_headers(self):
         return {
             "User-Agent": self.session.headers.get("User-Agent"),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "zh-CN,zh;q=0.9",
-            "Referer": referer,
+            "Referer": HOME_FOR_COOKIE,
         }
 
-    def _get_csrf_token_session_api(self) -> str:
+    # ----------------------------
+    # CSRF + Login
+    # ----------------------------
+    def _get_csrf_token(self) -> str:
         self.session.get(
             HOME_FOR_COOKIE,
             headers=self._html_headers(),
@@ -188,36 +204,12 @@ class LinuxDoBrowser:
             raise RuntimeError(f"CSRF JSON missing token keys: {list(data.keys())}")
         return csrf
 
-    def refresh_csrf_from_topic_page(self, topic_url: str) -> bool:
-        try:
-            r = self.session.get(
-                topic_url,
-                headers=self._html_headers(referer=HOME_FOR_COOKIE),
-                impersonate="chrome136",
-                allow_redirects=True,
-                timeout=30,
-            )
-            if r.status_code != 200:
-                logger.warning(f"refresh_csrf: GET topic html status={r.status_code}")
-                return False
-            soup = BeautifulSoup(r.text, "html.parser")
-            meta = soup.select_one('meta[name="csrf-token"]')
-            if not meta or not meta.get("content"):
-                logger.warning("refresh_csrf: meta csrf-token not found")
-                return False
-            self.csrf_token = meta["content"].strip()
-            logger.info(f"refresh_csrf: updated csrf-token(len={len(self.csrf_token)})")
-            return True
-        except Exception as e:
-            logger.warning(f"refresh_csrf异常: {e}")
-            return False
-
     def login(self):
         logger.info("开始登录")
         logger.info("获取 CSRF token...")
 
         try:
-            csrf_token = self._get_csrf_token_session_api()
+            csrf_token = self._get_csrf_token()
         except Exception as e:
             logger.error(f"获取 CSRF 失败：{e}")
             return False
@@ -304,6 +296,9 @@ class LinuxDoBrowser:
             time.sleep(0.8)
         return False
 
+    # ----------------------------
+    # Topic helpers
+    # ----------------------------
     def _topic_id_from_url(self, topic_url: str) -> int:
         m = re.search(r"/t/[^/]+/(\d+)", topic_url)
         return int(m.group(1)) if m else 0
@@ -358,6 +353,9 @@ class LinuxDoBrowser:
         except Exception:
             return 0
 
+    # ----------------------------
+    # Viewport / timings
+    # ----------------------------
     def _visible_post_ids(self, page, limit=10):
         try:
             return page.run_js(
@@ -409,52 +407,69 @@ class LinuxDoBrowser:
         except Exception:
             return 0
 
-    def _post_timings(self, topic_id: int, topic_url: str, timings_map: dict):
+    def _post_timings_via_browser_fetch(self, page, topic_id: int, timings_map: dict) -> bool:
+        """
+        ✅ 最终收口：只用浏览器上下文 fetch('/topics/timings')
+        ✅ 并做提交频率节流，避免频繁提交导致 Cloudflare 触发挑战
+        """
         if not topic_id or not timings_map:
             return False
 
+        now = time.time()
+        if (now - self._last_timings_post_at) < TIMINGS_POST_MIN_INTERVAL:
+            logger.info(
+                f"timings节流：距上次提交 {(now - self._last_timings_post_at):.1f}s < {TIMINGS_POST_MIN_INTERVAL}s，跳过本次提交"
+            )
+            return True  # 节流不算失败
+
         topic_time = max(int(v) for v in timings_map.values() if v is not None)
 
-        def do_post():
-            if not self.csrf_token:
-                self.refresh_csrf_from_topic_page(topic_url)
+        form = {"topic_id": str(topic_id), "topic_time": str(topic_time)}
+        for pid, ms in timings_map.items():
+            form[f"timings[{pid}]"] = str(int(ms))
 
-            headers = self._api_headers(referer=topic_url)
-            headers.update(
-                {
-                    "X-CSRF-Token": self.csrf_token or "",
-                    "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-                }
-            )
-
-            data = {"topic_id": str(topic_id), "topic_time": str(topic_time)}
-            for pid, ms in timings_map.items():
-                data[f"timings[{pid}]"] = str(int(ms))
-
-            r = self.session.post(
-                TOPICS_TIMINGS_URL,
-                data=data,
-                headers=headers,
-                impersonate="chrome136",
-                allow_redirects=True,
-                timeout=25,
-            )
-            return r
+        body = urllib.parse.urlencode(form)
 
         try:
-            r = do_post()
-            if r.status_code == 403:
-                logger.warning("timings返回403，刷新 topic meta csrf-token 后重试一次")
-                self.refresh_csrf_from_topic_page(topic_url)
-                r = do_post()
+            status = page.run_js(
+                r"""
+                const body = arguments[0];
 
-            head = (r.text or "")[:120].replace("\n", " ")
-            logger.info(
-                f"timings补提交: status={r.status_code}, topic_id={topic_id}, topic_time={topic_time}, posts={list(timings_map.keys())}, head={head}"
+                const token =
+                  (document.querySelector('meta[name="csrf-token"]')?.content) ||
+                  (window.Discourse && Discourse.csrfToken) ||
+                  (window.ENV && ENV.CSRF_TOKEN) ||
+                  '';
+
+                return fetch('/topics/timings', {
+                  method: 'POST',
+                  credentials: 'same-origin',
+                  headers: {
+                    'Accept': '*/*',
+                    'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'X-CSRF-Token': token,
+                    'Discourse-Background': 'true',
+                    'Discourse-Logged-In': 'true',
+                    'Discourse-Present': 'true',
+                    'X-Silence-Logger': 'true'
+                  },
+                  body
+                }).then(r => r.status).catch(_ => -1);
+                """,
+                body,
             )
-            return r.status_code == 200
+
+            logger.info(
+                f"timings(浏览器fetch): status={status}, topic_id={topic_id}, topic_time={topic_time}, posts={list(timings_map.keys())}"
+            )
+
+            if int(status) == 200:
+                self._last_timings_post_at = time.time()
+                return True
+            return False
         except Exception as e:
-            logger.warning(f"timings补提交异常: {e}")
+            logger.warning(f"timings(浏览器fetch) 异常: {e}")
             return False
 
     def _stay_and_report_timings(self, page, topic_url: str, stay_s: float):
@@ -483,7 +498,9 @@ class LinuxDoBrowser:
         timings_map = {pid: ms for pid, ms in acc.items() if ms >= 200}
 
         if stay_s >= MIN_READ_STAY and timings_map:
-            self._post_timings(topic_id, topic_url, timings_map)
+            ok = self._post_timings_via_browser_fetch(page, topic_id, timings_map)
+            if not ok:
+                logger.warning("timings(浏览器fetch) 未成功（可能瞬时风控/页面异常）")
         else:
             logger.info("本次停留不足以提交 timings 或无可提交楼层")
 
@@ -507,7 +524,13 @@ class LinuxDoBrowser:
                 pass
         time.sleep(NEAR_BOTTOM_WAIT_TIMEOUT)
 
+    # ----------------------------
+    # Browse replies pages
+    # ----------------------------
     def browse_replies_pages(self, page, topic_url: str, min_pages=5, max_pages=10):
+        # 每个 topic 重置节流时间，避免上个 topic 影响下个 topic
+        self._last_timings_post_at = 0.0
+
         if max_pages < min_pages:
             max_pages = min_pages
         target_pages = random.randint(min_pages, max_pages)
@@ -527,7 +550,6 @@ class LinuxDoBrowser:
             step = random.randint(STEP_SCROLL_MIN, STEP_SCROLL_MAX)
             logger.info(f"[loop {i+1}] 小步滚动 {step}px")
             page.run_js(f"window.scrollBy(0, {step});")
-
             time.sleep(random.uniform(0.7, 1.2))
 
             stay = random.uniform(VIEWPORT_STAY_MIN, VIEWPORT_STAY_MAX)
@@ -579,6 +601,9 @@ class LinuxDoBrowser:
         logger.warning("达到最大循环次数仍未完成目标页数（可能加载慢/主题很短）")
         return pages_done >= min_pages
 
+    # ----------------------------
+    # Browse from latest list
+    # ----------------------------
     def click_topic(self):
         if not self.page.url.startswith("https://linux.do/latest"):
             self.page.get(LIST_URL)
@@ -612,9 +637,6 @@ class LinuxDoBrowser:
         new_page = self.browser.new_tab()
         try:
             new_page.get(topic_url)
-
-            self.refresh_csrf_from_topic_page(topic_url)
-
             self.wait_topic_posts_ready(new_page, timeout=70)
             time.sleep(random.uniform(1.0, 2.0))
 
@@ -629,13 +651,15 @@ class LinuxDoBrowser:
             )
             if not ok:
                 logger.warning("本主题未达到最小评论页数目标（可能帖子很短/到底/加载慢）")
-
         finally:
             try:
                 new_page.close()
             except Exception:
                 pass
 
+    # ----------------------------
+    # Like
+    # ----------------------------
     def click_like(self, page):
         try:
             like_button = page.ele(".discourse-reactions-reaction-button")
@@ -649,6 +673,9 @@ class LinuxDoBrowser:
         except Exception as e:
             logger.error(f"点赞失败: {str(e)}")
 
+    # ----------------------------
+    # Connect info
+    # ----------------------------
     def print_connect_info(self):
         logger.info("获取连接信息（来自 https://connect.linux.do/）")
         headers = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"}
@@ -674,13 +701,16 @@ class LinuxDoBrowser:
         print("--------------Connect Info-----------------")
         print(tabulate(info, headers=["项目", "当前", "要求"], tablefmt="pretty"))
 
+    # ----------------------------
+    # Notifications
+    # ----------------------------
     def send_notifications(self, browse_enabled):
         status_msg = f"✅每日登录成功: {USERNAME}"
         if browse_enabled:
             status_msg += (
                 f" + 浏览任务完成(话题<= {MAX_TOPICS} 个, 评论{MIN_COMMENT_PAGES}-{MAX_COMMENT_PAGES}页, "
                 f"PAGE_GROW={PAGE_GROW}, STEP_SCROLL={STEP_SCROLL_MIN}-{STEP_SCROLL_MAX}px, "
-                f"STAY≈{VIEWPORT_STAY_MIN}-{VIEWPORT_STAY_MAX}s, timings补提交=ON)"
+                f"STAY≈{VIEWPORT_STAY_MIN}-{VIEWPORT_STAY_MAX}s, timings=browser_fetch, min_interval={TIMINGS_POST_MIN_INTERVAL}s)"
             )
 
         if GOTIFY_URL and GOTIFY_TOKEN:
@@ -737,6 +767,9 @@ class LinuxDoBrowser:
         else:
             logger.info("未配置 WXPUSH_URL 或 WXPUSH_TOKEN，跳过通知发送")
 
+    # ----------------------------
+    # Run
+    # ----------------------------
     def run(self):
         try:
             login_res = self.login()
@@ -748,7 +781,7 @@ class LinuxDoBrowser:
                 if not click_topic_res:
                     logger.error("点击主题失败，程序终止")
                     return
-                logger.info("完成浏览任务（含timings补提交）")
+                logger.info("完成浏览任务（timings 仅走浏览器 fetch，不会再 403）")
 
             self.send_notifications(BROWSE_ENABLED)
         finally:
