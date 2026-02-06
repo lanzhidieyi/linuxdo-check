@@ -2,7 +2,7 @@ name: Daily Check-in
 
 on:
   schedule:
-    - cron: '0 */3 * * *'  # 每 3 小时触发一次（UTC）
+    - cron: '0 */4 * * *'  # 每 3 小时触发一次（UTC）
   workflow_dispatch:
 
 jobs:
@@ -14,16 +14,25 @@ jobs:
       - name: Random delay (0–1 hour)
         shell: bash
         run: |
-          s=$(( RANDOM % 3600 ))
+          s=$(( RANDOM % 360 ))
           echo "Random sleep: $s seconds"
           sleep $s
 
       - uses: actions/checkout@v4
 
+      # 安装真实 Chrome
       - uses: browser-actions/setup-chrome@v1
 
       - name: Check Chrome version
-        run: chrome --version
+        run: |
+          which google-chrome || true
+          google-chrome --version || true
+
+      # 安装 Xvfb
+      - name: Install Xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -37,9 +46,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Execute script
+      # ✅ Xvfb + HEADLESS=false（非无头）
+      - name: Execute script (Xvfb + non-headless)
         env:
-          # 登录账号（脚本优先使用 LINUXDO_*）
           LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
           LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
           USERNAME: ${{ secrets.USERNAME }}
@@ -51,9 +60,19 @@ jobs:
           WXPUSH_URL: ${{ secrets.WXPUSH_URL }}
           WXPUSH_TOKEN: ${{ secrets.WXPUSH_TOKEN }}
 
-          BROWSE_ENABLED: ${{ secrets.BROWSE_ENABLED }}
+          BROWSE_ENABLED: "true"
+
+          # ✅ 强制非 headless
+          HEADLESS: "false"
+
+          # ✅ 明确 Chrome 路径（很重要）
+          CHROME_PATH: "/usr/bin/google-chrome"
+
+          # 可选：参数微调
+          # MIN_READ_STAY: "5"
+          # READ_STATE_TIMEOUT: "20"
         run: |
-          python main.py
+          xvfb-run -a --server-args="-screen 0 1920x1080x24 -ac +extension RANDR" python main.py
 
       - name: Send Telegram Success Notification
         env:
