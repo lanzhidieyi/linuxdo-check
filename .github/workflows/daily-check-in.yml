@@ -2,14 +2,15 @@ name: Daily Check-in
 
 on:
   schedule:
-    - cron: '0 */4 * * *'  # 每 3 小时触发一次（UTC）
+    #- cron: '0 1 * * *'  # 每天1点 UTC 时间执行
+    - cron: '0 */12 * * *'  # 每12小时执行一次
+
   workflow_dispatch:
 
 jobs:
   run_script:
     runs-on: ubuntu-22.04
     environment: LINUXDO
-
     steps:
       - name: Random delay (0–1 hour)
         shell: bash
@@ -17,86 +18,37 @@ jobs:
           s=$(( RANDOM % 360 ))
           echo "Random sleep: $s seconds"
           sleep $s
-
       - uses: actions/checkout@v4
-
-      # 安装真实 Chrome
       - uses: browser-actions/setup-chrome@v1
-
       - name: Check Chrome version
-        run: |
-          which google-chrome || true
-          google-chrome --version || true
-
-      # 安装 Xvfb
-      - name: Install Xvfb
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb
-
+        run: chrome --version
+        
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.9.19'
-          cache: 'pip'
-          cache-dependency-path: requirements.txt
 
       - name: Install python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      # ✅ Xvfb + HEADLESS=false（非无头）
-      - name: Execute script (Xvfb + non-headless)
+      - name: Execute script
         env:
-          LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
-          LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
           USERNAME: ${{ secrets.USERNAME }}
           PASSWORD: ${{ secrets.PASSWORD }}
-
+          LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
+          LINUXDO_PASSWORD: ${{ secrets.LINUXDO_PASSWORD }}
           GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
           GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
           SC3_PUSH_KEY: ${{ secrets.SC3_PUSH_KEY }}
           WXPUSH_URL: ${{ secrets.WXPUSH_URL }}
           WXPUSH_TOKEN: ${{ secrets.WXPUSH_TOKEN }}
-
-          BROWSE_ENABLED: "true"
-
-          # ✅ 强制非 headless
-          HEADLESS: "false"
-
-          # ✅ 明确 Chrome 路径（很重要）
-          CHROME_PATH: "/usr/bin/google-chrome"
-
-          # 可选：参数微调
-          # MIN_READ_STAY: "5"
-          # READ_STATE_TIMEOUT: "20"
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BROWSE_ENABLED: ${{ secrets.BROWSE_ENABLED }}
         run: |
-          xvfb-run -a --server-args="-screen 0 1920x1080x24 -ac +extension RANDR" python main.py
-
-      - name: Send Telegram Success Notification
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_USERID: ${{ secrets.TELEGRAM_USERID }}
-          LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
-        if: ${{ success() && env.TELEGRAM_TOKEN != '' && env.TELEGRAM_USERID != '' }}
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ env.TELEGRAM_TOKEN }}/sendMessage" \
-          -d chat_id=${{ env.TELEGRAM_USERID }} \
-          -d parse_mode=HTML \
-          -d text="✅ <b>LINUX DO</b>\n👤 用户：<code>${{ env.LINUXDO_USERNAME }}</code>\n🎉 每日签到成功完成"
-
-      - name: Send Telegram Failure Notification
-        env:
-          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_USERID: ${{ secrets.TELEGRAM_USERID }}
-          LINUXDO_USERNAME: ${{ secrets.LINUXDO_USERNAME }}
-        if: ${{ failure() && env.TELEGRAM_TOKEN != '' && env.TELEGRAM_USERID != '' }}
-        run: |
-          curl -s -X POST "https://api.telegram.org/bot${{ env.TELEGRAM_TOKEN }}/sendMessage" \
-          -d chat_id=${{ env.TELEGRAM_USERID }} \
-          -d parse_mode=HTML \
-          -d text="❌ <b>LINUX DO</b>\n👤 用户：<code>${{ env.LINUXDO_USERNAME }}</code>\n⚠️ 每日签到失败，请查看 Actions 日志"
+          python main.py
 
       - name: Delete workflow runs
         uses: Mattraks/delete-workflow-runs@v2
