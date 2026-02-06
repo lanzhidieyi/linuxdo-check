@@ -68,7 +68,7 @@ BROWSE_ENABLED = os.environ.get("BROWSE_ENABLED", "true").strip().lower() not in
 HEADLESS = os.environ.get("HEADLESS", "false").strip().lower() not in ["false", "0", "off"]
 
 # 每次运行最多进入多少个话题帖
-MAX_TOPICS = int(os.environ.get("MAX_TOPICS", "50"))
+MAX_TOPICS = int(os.environ.get("MAX_TOPICS", "10"))
 
 # 每个话题至少/最多浏览多少“页/批次”评论
 MIN_COMMENT_PAGES = int(os.environ.get("MIN_COMMENT_PAGES", "5"))
